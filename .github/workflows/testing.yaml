@@ -69,7 +69,7 @@ jobs:
 
       - name: "Running local action: ${{ github.repository }}"
         id: cbom
-        uses: ./
+        uses: $/
         with:
           path_prefix: "tests/fixtures/${{ matrix.language }}"
           languages: ${{ matrix.language }}
@@ -162,7 +162,7 @@ jobs:
       # 'go' from go.mod alone.
       - name: "Auto-detect language"
         id: detect
-        uses: ./
+        uses: $/
         with:
           path_prefix: "tests/fixtures/go"
           output_directory: "detect-output"
@@ -189,7 +189,7 @@ jobs:
       # a polyglot estate contains repositories it cannot scan.
       - name: "Skip when no language present"
         id: skip
-        uses: ./
+        uses: $/
         with:
           path_prefix: "tests/fixtures/none"
 
@@ -223,7 +223,7 @@ jobs:
       # workflows rely on exactly this.
       - name: "Scanner failure is non-blocking by default"
         id: soft-fail
-        uses: ./
+        uses: $/
         with:
           path_prefix: "tests/fixtures/go"
           languages: "go"
@@ -245,7 +245,7 @@ jobs:
       # The same failure with fail_on_error true must stop the job.
       - name: "Scanner failure blocks when fail_on_error is true"
         id: hard-fail
-        uses: ./
+        uses: $/
         continue-on-error: true
         with:
           path_prefix: "tests/fixtures/go"
@@ -277,7 +277,7 @@ jobs:
       # so the action must reject them before that point.
       - name: "Reject unsupported language"
         id: bad-language
-        uses: ./
+        uses: $/
         continue-on-error: true
         with:
           path_prefix: "tests/fixtures/go"
@@ -299,7 +299,7 @@ jobs:
       # path_prefix must not escape the workspace.
       - name: "Reject path_prefix outside the workspace"
         id: escape
-        uses: ./
+        uses: $/
         continue-on-error: true
         with:
           path_prefix: "../../../etc"
@@ -322,7 +322,7 @@ jobs:
       # paths. Checked at point of use as well as during validation.
       - name: "Reject output_directory outside the workspace"
         id: escape-output
-        uses: ./
+        uses: $/
         continue-on-error: true
         with:
           path_prefix: "tests/fixtures/go"

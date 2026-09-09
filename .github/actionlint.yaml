@@ -1,11 +1,26 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Path-specific configurations.
 paths:
   .github/workflows/testing.yaml:
     ignore:
-      # Ignore deliberate test failure
-      - 'input "invalid_input" is not defined in action .+'
-      - 'missing input "input" which is required by action .+'
+      # GitHub introduced the self-repository 'uses: $/...' syntax in
+      # July 2026, and zizmor's self-repository audit (v1.30.0+) now
+      # reports the older workspace-relative './' form as a finding.
+      # actionlint does not recognise the new syntax yet: its latest
+      # release, v1.7.12, predates the announcement, so it rejects
+      # '$/' as a malformed ref-less action reference. The two linters
+      # therefore disagree, and this ignore holds the line until
+      # actionlint ships support.
+      #
+      # Remove this entry once rhysd/actionlint#711 lands in a release
+      # and the pinned actionlint-py revision picks it up.
+      # https://github.com/rhysd/actionlint/issues/711
+      #
+      # Note the '.*': this action lives at the repository root, so
+      # its self-repository reference is a bare '$/' with no trailing
+      # path. The '\$/.+' pattern suggested upstream assumes a
+      # subdirectory action and does not match here.
+      - 'specifying action "\$/.*" in invalid format because ref is missing'
