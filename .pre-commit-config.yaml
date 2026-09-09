@@ -23,7 +23,11 @@ ci:
 default_install_hook_types: [pre-commit, commit-msg]
 default_stages: [pre-commit]
 
-exclude: "^docs/conf.py"
+# tests/fixtures holds deliberately minimal sample projects that exist
+# only to give the CBOM scanner known cryptographic assets to find.
+# They are not importable code: the Python fixture depends on a package
+# this repository does not install, so type checkers cannot resolve it.
+exclude: "^(docs/conf\\.py|tests/fixtures/)"
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
