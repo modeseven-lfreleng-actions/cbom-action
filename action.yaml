@@ -1,53 +1,581 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# cbom-action
+name: "🔑 CBOM Generator"
+# yamllint disable-line rule:line-length
+description: "Generates CycloneDX Cryptography Bill of Materials (CBOM) reports"
+# Companion to sbom-action: the input/output contract deliberately
+# mirrors it so callers see one shape across the actions estate.
+#
+# The scanning engine is CBOMkit (https://github.com/cbomkit), which
+# wraps the sonar-cryptography plugin. Upstream ships a Docker action,
+# but this action invokes the published container directly instead of
+# composing that action. Three reasons:
+#
+#   1. Determinism. The image reference is pinned by DIGEST here.
+#      Upstream releases <= v2.2.0 shipped 'image: Dockerfile' with a
+#      'FROM ghcr.io/cbomkit/cbomkit-action:edge' base, so pinning the
+#      action to a commit SHA still resolved to a floating image built
+#      from main. Upstream fixed this in v2.3.0, but its release job
+#      force-moves git tags, so the commit a SHA pin refers to is not
+#      guaranteed to stay reachable. A digest has neither problem.
+#   2. path_prefix. The scanner reads GITHUB_WORKSPACE and offers no
+#      project-directory option, so it always scans the whole
+#      workspace. Invoking the container directly lets the project
+#      directory mount AS the workspace, which restores parity with
+#      every other action in the estate.
+#   3. Output ownership. The image declares USER 0:0, so CBOMs land in
+#      the workspace owned by root and trip later workflow steps.
+#      Running with an explicit --user avoids that.
+#
+# Java scans do NOT require a prior build to succeed, though building
+# first improves symbol resolution and therefore accuracy.
 
 inputs:
-  input:
-    description: "Description of input"
-    required: true
+  # Optional
+  path_prefix:
+    description: "Project directory; must resolve within the workspace"
+    required: false
+    default: "."
+  languages:
+    # yamllint disable-line rule:line-length
+    description: "Comma-separated languages to scan; empty auto-detects from the tree"
+    required: false
+    default: ""
+  output_directory:
+    description: "CBOM report directory, within workspace or runner temp"
+    required: false
+    default: "."
+  exclude:
+    # yamllint disable-line rule:line-length
+    description: "Comma-separated Java regex patterns excluded from scanning; empty keeps the upstream default (skip test files)"
+    required: false
+    default: ""
+
+  module_cboms:
+    description: "Emit a per-module CBOM alongside the consolidated one"
+    required: false
+    default: "true"
+  empty_cboms:
+    description: "Write CBOM files even when a scan finds no assets"
+    required: false
+    default: "true"
+  fail_on_error:
+    # yamllint disable-line rule:line-length
+    description: "Fail the action if CBOM generation encounters errors. Defaults false: CBOM output is advisory and gates nothing downstream"
+    required: false
+    default: "false"
+  image:
+    # yamllint disable-line rule:line-length
+    description: "CBOMkit scanner image; pin by digest to keep results reproducible"
+    required: false
+    # yamllint disable-line rule:line-length
+    default: "ghcr.io/cbomkit/cbomkit-action@sha256:47c2505267dc5f055152616ffa0d0076b7d0824fe9e0de670b572d1ebad2fc4b"  # v2.3.0
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  cbom_path:
+    description: "Path to the consolidated CBOM, empty when none produced"
+    value: ${{ steps.generate.outputs.cbom_path }}
+  cbom_pattern:
+    description: "Glob matching every CBOM file produced"
+    value: ${{ steps.generate.outputs.cbom_pattern }}
+  file_count:
+    description: "Number of CBOM files produced"
+    value: ${{ steps.generate.outputs.file_count }}
+  asset_count:
+    description: "Cryptographic assets in the consolidated CBOM"
+    value: ${{ steps.generate.outputs.asset_count }}
+  languages:
+    description: "Languages actually scanned"
+    value: ${{ steps.validate.outputs.languages }}
+  outcome:
+    # yamllint disable-line rule:line-length
+    description: "Result of the scan: 'success', 'failed' or 'skipped' (no supported language present)"
+    value: ${{ steps.generate.outputs.outcome }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Validate inputs"
+      id: validate
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_LANGUAGES: ${{ inputs.languages }}
+        INPUT_OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
+        INPUT_MODULE_CBOMS: ${{ inputs.module_cboms }}
+        INPUT_EMPTY_CBOMS: ${{ inputs.empty_cboms }}
+        INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        INPUT_IMAGE: ${{ inputs.image }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Validate inputs
+        # Preflight: fail with a clear message when required tools
+        # are missing (possible on minimal self-hosted runners).
+        # docker and jq are checked later, only on the path that
+        # actually needs them, so a repository with no supported
+        # language still reports 'skipped' on a minimal runner.
+        # realpath is needed here, for the path validation below.
+        if ! command -v realpath > /dev/null 2>&1; then
+          echo "Error: required tool not found: realpath ❌"
+          echo "This action requires realpath (GNU coreutils)"
           exit 1
         fi
-
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+        # The action requires GNU realpath -m (missing-path
+        # resolution); BSD/macOS realpath lacks it, and failing here
+        # gives a clearer error than a mid-run failure
+        if ! realpath -m -- / > /dev/null 2>&1; then
+          echo "Error: realpath does not support the -m option ❌"
+          echo "This action requires GNU coreutils realpath"
+          exit 1
+        fi
+        # The workspace/temp boundary checks depend on these runner
+        # environment variables: an empty value would degrade the
+        # case patterns to /* and disable the escape checks
+        for dir_var in GITHUB_WORKSPACE RUNNER_TEMP; do
+          dir_value="${!dir_var:-}"
+          if [ -z "${dir_value}" ] || [ ! -d "${dir_value}" ]; then
+            echo "Error: ${dir_var} not set to a directory ❌"
+            echo "This action requires a standard runner environment"
+            exit 1
+          fi
         done
+        for flag_var in INPUT_MODULE_CBOMS \
+          INPUT_EMPTY_CBOMS INPUT_FAIL_ON_ERROR; do
+          case "${!flag_var}" in
+            true|false) ;;
+            *)
+              echo "Error: ${flag_var} must be 'true' or 'false' ❌"
+              exit 1 ;;
+          esac
+        done
+        # A leading dash is rejected before anything else: the image
+        # is the final argument to 'docker run', so a value such as
+        # '--privileged' would be parsed as another CLI flag rather
+        # than an image name. Docker has no '--' end-of-options
+        # separator before the image, so validation is the only guard.
+        case "${INPUT_IMAGE}" in
+          -*)
+            echo "Error: image reference cannot begin with '-' ❌"
+            echo "A leading dash parses as a docker run flag"
+            exit 1 ;;
+          *[!A-Za-z0-9./:@_-]*|'')
+            echo "Error: invalid image reference ❌"
+            echo "Allowed characters: A-Z a-z 0-9 . / : @ _ -"
+            exit 1 ;;
+        esac
+        # Require a digest-pinned image by default but allow a tag for
+        # local experimentation; warn loudly so a tagged reference
+        # never silently becomes the norm in a pipeline
+        case "${INPUT_IMAGE}" in
+          *@sha256:*)
+            # Validate the digest rather than trusting the '@sha256:'
+            # prefix, so a truncated or malformed value fails here
+            # with a clear message instead of at 'docker run'
+            image_digest="${INPUT_IMAGE##*@sha256:}"
+            case "${image_digest}" in
+              *[!0-9a-f]*|'')
+                echo "Error: image digest is not hexadecimal ❌"
+                exit 1 ;;
+            esac
+            if [ "${#image_digest}" -ne 64 ]; then
+              echo "Error: image digest must be 64 characters ❌"
+              echo "Got ${#image_digest} character(s)"
+              exit 1
+            fi ;;
+          *)
+            echo "::warning::CBOM scanner image is not digest-pinned;" \
+              "results are not reproducible" ;;
+        esac
+
+        # Anchor relative paths to GITHUB_WORKSPACE: composite
+        # actions can run with a caller-set working directory, so
+        # resolving against the current directory would be
+        # non-deterministic
+        case "${INPUT_PATH_PREFIX}" in
+          /*) project_dir="${INPUT_PATH_PREFIX}" ;;
+          *) project_dir="${GITHUB_WORKSPACE}/${INPUT_PATH_PREFIX}" ;;
+        esac
+        if [ ! -d "${project_dir}" ]; then
+          echo "Error: invalid project directory ❌"
+          # Strip CR/LF before logging the untrusted path: embedded
+          # newlines could otherwise inject workflow commands via the
+          # log stream
+          printf 'Path not found: %s\n' \
+            "$(printf '%s' "${project_dir}" | tr -d '\r\n')"
+          exit 1
+        fi
+        # Restrict scanning to the workspace: an absolute or escaped
+        # path could otherwise expose runner filesystem details in the
+        # CBOM and any uploaded artifacts
+        project_dir="$(realpath -- "${project_dir}")"
+        workspace="$(realpath -- "${GITHUB_WORKSPACE}")"
+        case "${project_dir}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+
+        # Resolve the output directory BEFORE any mkdir, and apply the
+        # boundary check in all cases: writing elsewhere on the runner
+        # filesystem is an operational/security risk
+        output_directory="${INPUT_OUTPUT_DIRECTORY}"
+        if [ -z "${output_directory}" ]; then
+          output_directory="."
+        fi
+        case "${output_directory}" in
+          /*) ;;
+          *) output_directory="${GITHUB_WORKSPACE}/${output_directory}" ;;
+        esac
+        output_dir="$(realpath -m -- "${output_directory}")"
+        temp_dir="$(realpath -- "${RUNNER_TEMP}")"
+        case "${output_dir}/" in
+          "${workspace}/"*|"${temp_dir}/"*) ;;
+          *)
+            echo "Error: output directory escapes the workspace ❌"
+            echo "output_directory must resolve within"
+            echo "GITHUB_WORKSPACE or RUNNER_TEMP"
+            exit 1 ;;
+        esac
+
+        # Language selection. The scanner maps each value onto a Java
+        # enum with valueOf(), which throws on anything unrecognised
+        # and kills the container, so validate here where the error
+        # message can explain itself.
+        languages=""
+        add_language() {
+          case ",${languages}," in
+            *",$1,"*) ;;
+            *) languages="${languages:+${languages},}$1" ;;
+          esac
+        }
+        if [ -n "${INPUT_LANGUAGES}" ]; then
+          # Split on commas, trim spaces, lowercase, then validate
+          while IFS= read -r raw; do
+            lang="$(printf '%s' "${raw}" | tr -d '[:space:]' \
+              | tr '[:upper:]' '[:lower:]')"
+            [ -n "${lang}" ] || continue
+            case "${lang}" in
+              java|python|go) ;;
+              csharp)
+                # Upstream ships this as a preview: no detection rules
+                # beyond those verifying the engine, single-method
+                # scope, C# v7 only. Permitted, but never silently.
+                echo "::warning::csharp support is a preview upstream" \
+                  "and is not production ready" ;;
+              *)
+                echo "Error: unsupported language: ${lang} ❌"
+                echo "Supported languages: java, python, go, csharp"
+                exit 1 ;;
+            esac
+            add_language "${lang}"
+            # printf emits a trailing newline deliberately: without one
+            # 'read' returns non-zero on the final value and the loop
+            # body silently skips it
+          done < <(printf '%s\n' "${INPUT_LANGUAGES}" | tr ',' '\n')
+        else
+          # Auto-detect. Marker files keep this cheap and predictable;
+          # -prune on .git avoids matching anything in object storage.
+          find_marker() {
+            find "${project_dir}" -name .git -prune -o \
+              -type f -name "$1" -print -quit 2>/dev/null
+          }
+          for marker in pom.xml build.gradle build.gradle.kts; do
+            if [ -n "$(find_marker "${marker}")" ]; then
+              add_language java
+              break
+            fi
+          done
+          if [ -n "$(find_marker go.mod)" ]; then
+            add_language go
+          fi
+          for marker in pyproject.toml setup.py setup.cfg \
+            'requirements*.txt' '*.py'; do
+            if [ -n "$(find_marker "${marker}")" ]; then
+              add_language python
+              break
+            fi
+          done
+        fi
+
+        if [ -z "${languages}" ]; then
+          echo "No supported language detected; nothing to scan ⏭️"
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          # Only the scanning path needs these, so checking here keeps
+          # the skip path usable on a runner without them
+          for tool in docker jq; do
+            if ! command -v "${tool}" > /dev/null 2>&1; then
+              echo "Error: required tool not found: ${tool} ❌"
+              echo "Scanning ${languages} requires docker and jq"
+              exit 1
+            fi
+          done
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Languages selected: ${languages}"
+        fi
+        echo "languages=${languages}" >> "$GITHUB_OUTPUT"
+        # project_dir and output_dir derive from caller-controlled
+        # inputs and can legally contain newlines, so use the
+        # multiline heredoc output format with a random delimiter
+        # (shell-builtin randomness, regenerated until provably
+        # absent) to prevent output-file injection
+        emit_output() {
+          key="$1"
+          value="$2"
+          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+        emit_output "project_dir" "${project_dir}"
+        emit_output "output_dir" "${output_dir}"
+
+    - name: "Generate CBOM"
+      id: generate
+      shell: bash
+      env:
+        SKIP: ${{ steps.validate.outputs.skip }}
+        LANGUAGES: ${{ steps.validate.outputs.languages }}
+        PROJECT_DIR: ${{ steps.validate.outputs.project_dir }}
+        OUTPUT_DIR: ${{ steps.validate.outputs.output_dir }}
+        EXCLUDE: ${{ inputs.exclude }}
+        MODULE_CBOMS: ${{ inputs.module_cboms }}
+        EMPTY_CBOMS: ${{ inputs.empty_cboms }}
+        FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        IMAGE: ${{ inputs.image }}
+      run: |
+        # Generate CBOM
+        emit_output() {
+          key="$1"
+          value="$2"
+          # Path values derive from the caller-controlled
+          # output_directory and can legally contain newlines, so use
+          # the multiline heredoc output format with a random
+          # delimiter (shell-builtin randomness, regenerated until
+          # provably absent) to prevent output-file injection
+          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+
+        if [ "${SKIP}" = "true" ]; then
+          {
+            echo "outcome=skipped"
+            echo "file_count=0"
+            echo "asset_count=0"
+            echo "cbom_path="
+            echo "cbom_pattern="
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## 🔑 CBOM Generation Results"
+            echo ""
+            echo "No supported language detected; scan skipped ⏭️"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # Re-resolve and enforce the workspace boundary at the point
+        # of use: the workspace is mutable between steps, so relying
+        # solely on the earlier validate step would leave a TOCTOU
+        # gap (a validated directory swapped for an escaping symlink)
+        PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")"
+        boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")"
+        temp_boundary="$(realpath -- "${RUNNER_TEMP:?}")"
+        case "${PROJECT_DIR}/" in
+          "${boundary}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            exit 1 ;;
+        esac
+        # OUTPUT_DIR needs the same point-of-use treatment. Resolve
+        # with -m and check BEFORE mkdir, then re-resolve and check
+        # again afterwards: the first check rejects a path that
+        # already escapes, the second catches a component swapped for
+        # an escaping symlink between the validate step and now. The
+        # directory is both written to and bind-mounted below, so an
+        # escape here would expose arbitrary runner paths.
+        check_output_boundary() {
+          case "$1/" in
+            "${boundary}/"*|"${temp_boundary}/"*) ;;
+            *)
+              echo "Error: output directory escapes the workspace ❌"
+              exit 1 ;;
+          esac
+        }
+        OUTPUT_DIR="$(realpath -m -- "${OUTPUT_DIR}")"
+        check_output_boundary "${OUTPUT_DIR}"
+        mkdir -p -- "${OUTPUT_DIR}"
+        OUTPUT_DIR="$(realpath -- "${OUTPUT_DIR}")"
+        check_output_boundary "${OUTPUT_DIR}"
+
+        # 'docker run --volume' splits its argument on ':', and both
+        # paths trace back to caller-controlled inputs. A colon is
+        # legal in a POSIX path, so '/ws/my:dir' would split into a
+        # different host path, container path and option list, mounting
+        # somewhere unintended or failing obscurely. A newline would
+        # corrupt the argument just as badly. Neither can be escaped in
+        # a mount specification, so reject both with a clear message.
+        newline="$(printf '\nx')"
+        newline="${newline%x}"
+        for mount_var in PROJECT_DIR OUTPUT_DIR; do
+          mount_path="${!mount_var}"
+          case "${mount_path}" in
+            *:*)
+              echo "Error: ${mount_var} contains a colon ❌"
+              echo "A docker mount specification cannot express one"
+              exit 1 ;;
+            *"${newline}"*)
+              echo "Error: ${mount_var} contains a newline ❌"
+              exit 1 ;;
+          esac
+        done
+
+        # The scanner reads GITHUB_WORKSPACE as its scan root and has
+        # no project-directory option, so mount the project directory
+        # AS the workspace. Output goes to its own mount so the
+        # scanner writes through a path it never indexes.
+        #
+        # Note this does not isolate the files themselves: an
+        # output_directory nested under path_prefix still surfaces
+        # inside /scan through the project mount. That is harmless in
+        # practice, because the indexers match source extensions and
+        # never .json, but it does mean the mounts alone are not a
+        # containment boundary.
+        #
+        # The mount is read-write on purpose: the Go scanner extracts
+        # a helper binary into the scan tree at runtime.
+        #
+        # CBOMKIT_JAVA_REQUIRE_BUILD is pinned to false rather than
+        # exposed as an input. Upstream gates it on
+        # 'javaDependencyJars.isEmpty() && javaClassDirectories
+        # .isEmpty()', but Main.java unconditionally adds the project
+        # directory to both lists, so the guard cannot fire and the
+        # setting is currently a no-op. Pinning the safe value means a
+        # future upstream fix cannot start failing jobs that callers
+        # asked to be non-blocking.
+        set -- \
+          --rm \
+          --user "$(id -u):$(id -g)" \
+          --volume "${PROJECT_DIR}:/scan" \
+          --volume "${OUTPUT_DIR}:/out" \
+          --env "GITHUB_WORKSPACE=/scan" \
+          --env "CBOMKIT_OUTPUT_DIR=/out" \
+          --env "CBOMKIT_LANGUAGES=${LANGUAGES}" \
+          --env "CBOMKIT_JAVA_REQUIRE_BUILD=false" \
+          --env "CBOMKIT_GENERATE_MODULE_CBOMS=${MODULE_CBOMS}" \
+          --env "CBOMKIT_WRITE_EMPTY_CBOMS=${EMPTY_CBOMS}" \
+          --env "HOME=/tmp"
+        # Populate the CBOM metadata block (gitUrl, revision, commit)
+        # that the CBOMkit viewer reads. Absent values are optional
+        # upstream, so pass them through only when set.
+        for passthrough in GITHUB_SERVER_URL GITHUB_REPOSITORY \
+          GITHUB_REF_NAME GITHUB_SHA; do
+          value="${!passthrough:-}"
+          if [ -n "${value}" ]; then
+            set -- "$@" --env "${passthrough}=${value}"
+          fi
+        done
+        if [ -n "${EXCLUDE}" ]; then
+          set -- "$@" --env "CBOMKIT_EXCLUDE=${EXCLUDE}"
+        fi
+
+        echo "Scanning ${LANGUAGES} with CBOMkit"
+        set +e
+        docker run "$@" "${IMAGE}"
+        scan_exit=$?
+        set -e
+
+        if [ "${scan_exit}" != "0" ]; then
+          echo "CBOMkit exited with code ${scan_exit}"
+          {
+            echo "## 🔑 CBOM Generation Results"
+            echo ""
+            echo "CBOM generation failed (exit ${scan_exit}) ❌"
+            echo ""
+            echo "**Languages:** ${LANGUAGES}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "outcome=failed"
+            echo "file_count=0"
+            echo "asset_count=0"
+            echo "cbom_path="
+            echo "cbom_pattern="
+          } >> "$GITHUB_OUTPUT"
+          if [ "${FAIL_ON_ERROR}" = "true" ]; then
+            echo "::error::CBOM generation failed ❌"
+            exit 1
+          fi
+          echo "::warning::CBOM generation failed; continuing" \
+            "(fail_on_error: false)"
+          exit 0
+        fi
+
+        # A clean exit with no consolidated CBOM is legitimate: with
+        # empty_cboms false the scanner writes nothing when a scan
+        # finds no cryptographic assets.
+        consolidated="${OUTPUT_DIR}/cbom.json"
+        # Parsing runs under 'set -e' with pipefail, so guard every
+        # step: a malformed or unreadable result must not hard-fail a
+        # job the caller asked to be non-blocking
+        file_count="$(find "${OUTPUT_DIR}" -maxdepth 1 -type f \
+          -name 'cbom*.json' 2>/dev/null | wc -l \
+          | tr -d '[:space:]' || true)"
+        [ -n "${file_count}" ] || file_count=0
+        asset_count=0
+        if [ -f "${consolidated}" ]; then
+          # Crypto findings are CycloneDX components carrying the
+          # cryptographic-asset type; other component types (such as
+          # the scanned application itself) are not findings
+          asset_count="$(jq '[.components[]?
+            | select(.type == "cryptographic-asset")] | length' \
+            "${consolidated}" 2>/dev/null || true)"
+          if [ -z "${asset_count}" ]; then
+            echo "::warning::Could not parse ${consolidated}"
+            asset_count=0
+          fi
+        else
+          consolidated=""
+        fi
+
+        emit_output "cbom_path" "${consolidated}"
+        if [ "${file_count}" != "0" ]; then
+          emit_output "cbom_pattern" "${OUTPUT_DIR}/cbom*.json"
+        else
+          emit_output "cbom_pattern" ""
+        fi
         {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
+          echo "outcome=success"
+          echo "file_count=${file_count}"
+          echo "asset_count=${asset_count}"
         } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "CBOM generation complete:" \
+          "${asset_count} cryptographic asset(s) ✅"
+        {
+          echo "## 🔑 CBOM Generation Results"
+          echo ""
+          echo "| Property | Value |"
+          echo "| -------- | ----- |"
+          echo "| Languages | ${LANGUAGES} |"
+          echo "| Cryptographic assets | ${asset_count} |"
+          echo "| CBOM files | ${file_count} |"
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "${file_count}" = "0" ]; then
+          echo ""
+          echo "No CBOM files produced; the scan found no assets ⚠️"
+        fi >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+[project]
+name = "cbom-python-fixture"
+version = "1.0.0"
+description = "Test fixture with known pyca/cryptography assets"
+requires-python = ">=3.10"
+dependencies = ["cryptography"]

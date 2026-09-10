@@ -1,6 +1,6 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
 name: "Test GitHub Action 🧪"
@@ -20,13 +20,26 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  # Scans of the language fixtures. Asset counts are exact, not
+  # lower bounds: the fixtures are fixed and the scanner image is
+  # digest-pinned, so a change in either must surface here rather
+  # than pass silently.
+  scan:
+    name: "Scan ${{ matrix.language }} fixture"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: "java"
+            assets: "4"
+          - language: "python"
+            assets: "4"
+          - language: "go"
+            assets: "2"
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
@@ -36,55 +49,332 @@ jobs:
         with:
           config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
-      # Harden the runner with the just-loaded allow-list.
-      - name: 'Harden runner (block)'
+      # Harden the runner with the just-loaded allow-list, plus the
+      # registry endpoints the scanner image pull needs.
+      - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
-          egress-policy: 'block'
+          egress-policy: "block"
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
 
       - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
-        shell: bash
-        run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
-
       - name: "Running local action: ${{ github.repository }}"
-        uses: ./
+        id: cbom
+        uses: $/
         with:
-          input: "test input 💬"
+          path_prefix: "tests/fixtures/${{ matrix.language }}"
+          languages: ${{ matrix.language }}
+          output_directory: "cbom-output"
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Validate scan results"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          LANGUAGE: ${{ matrix.language }}
+          EXPECTED_ASSETS: ${{ matrix.assets }}
+          OUTCOME: ${{ steps.cbom.outputs.outcome }}
+          ASSET_COUNT: ${{ steps.cbom.outputs.asset_count }}
+          FILE_COUNT: ${{ steps.cbom.outputs.file_count }}
+          CBOM_PATH: ${{ steps.cbom.outputs.cbom_path }}
+          LANGUAGES: ${{ steps.cbom.outputs.languages }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Validate scan results
+          status=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "Error: $1 was '$2', expected '$3' ❌"
+              status=1
+            else
+              echo "$1: $2 ✅"
+            fi
+          }
+          check "outcome" "${OUTCOME}" "success"
+          check "languages" "${LANGUAGES}" "${LANGUAGE}"
+          check "asset_count" "${ASSET_COUNT}" "${EXPECTED_ASSETS}"
 
+          if [ ! -f "${CBOM_PATH}" ]; then
+            echo "Error: cbom_path does not exist: ${CBOM_PATH} ❌"
+            status=1
+          else
+            echo "cbom_path exists: ${CBOM_PATH} ✅"
+          fi
+          if [ "${FILE_COUNT}" = "0" ]; then
+            echo "Error: file_count was 0 ❌"
+            status=1
+          fi
+
+          # The output directory must not leak into the scanned tree
+          if [ -e "tests/fixtures/${LANGUAGE}/cbom-output" ]; then
+            echo "Error: output written inside the scanned tree ❌"
+            status=1
+          fi
+          # Root-owned output would break later workflow steps; the
+          # action runs the container with an explicit --user to
+          # prevent it, so prove the files are writable by the runner
+          if [ ! -w "${CBOM_PATH}" ]; then
+            echo "Error: CBOM not writable by the runner user ❌"
+            ls -l "${CBOM_PATH}"
+            status=1
+          else
+            echo "CBOM ownership correct ✅"
+          fi
+          exit "${status}"
+
+  # Behavioural contract: auto-detection, the skip path, and the
+  # non-blocking guarantee that the reusable workflows depend on.
+  behaviour:
+    name: "Behavioural tests"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: ./
-        id: failure
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: "block"
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Auto-detection: no languages input, so the action must infer
+      # 'go' from go.mod alone.
+      - name: "Auto-detect language"
+        id: detect
+        uses: $/
+        with:
+          path_prefix: "tests/fixtures/go"
+          output_directory: "detect-output"
+
+      - name: "Validate auto-detection"
+        shell: bash
+        env:
+          LANGUAGES: ${{ steps.detect.outputs.languages }}
+          OUTCOME: ${{ steps.detect.outputs.outcome }}
+        run: |
+          # Validate auto-detection
+          if [ "${LANGUAGES}" != "go" ]; then
+            echo "Error: auto-detected '${LANGUAGES}', expected 'go' ❌"
+            exit 1
+          fi
+          if [ "${OUTCOME}" != "success" ]; then
+            echo "Error: outcome was '${OUTCOME}' ❌"
+            exit 1
+          fi
+          echo "Auto-detection selected 'go' ✅"
+
+      # A tree with no supported language must skip cleanly rather
+      # than fail: reusable workflows enable this job by default and
+      # a polyglot estate contains repositories it cannot scan.
+      - name: "Skip when no language present"
+        id: skip
+        uses: $/
+        with:
+          path_prefix: "tests/fixtures/none"
+
+      - name: "Validate skip behaviour"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.skip.outputs.outcome }}
+          LANGUAGES: ${{ steps.skip.outputs.languages }}
+          FILE_COUNT: ${{ steps.skip.outputs.file_count }}
+        run: |
+          # Validate skip behaviour
+          status=0
+          if [ "${OUTCOME}" != "skipped" ]; then
+            echo "Error: outcome was '${OUTCOME}', expected 'skipped' ❌"
+            status=1
+          fi
+          if [ -n "${LANGUAGES}" ]; then
+            echo "Error: languages was '${LANGUAGES}', expected empty ❌"
+            status=1
+          fi
+          if [ "${FILE_COUNT}" != "0" ]; then
+            echo "Error: file_count was '${FILE_COUNT}' ❌"
+            status=1
+          fi
+          [ "${status}" = "0" ] && echo "Skip behaviour correct ✅"
+          exit "${status}"
+
+      # The non-blocking guarantee. An unresolvable image digest makes
+      # the scan fail; with fail_on_error false (the default) the step
+      # must still succeed and report outcome 'failed'. The reusable
+      # workflows rely on exactly this.
+      - name: "Scanner failure is non-blocking by default"
+        id: soft-fail
+        uses: $/
+        with:
+          path_prefix: "tests/fixtures/go"
+          languages: "go"
+          # yamllint disable-line rule:line-length
+          image: "ghcr.io/cbomkit/cbomkit-action@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+      - name: "Validate non-blocking failure"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.soft-fail.outputs.outcome }}
+        run: |
+          # Validate non-blocking failure
+          if [ "${OUTCOME}" != "failed" ]; then
+            echo "Error: outcome was '${OUTCOME}', expected 'failed' ❌"
+            exit 1
+          fi
+          echo "Scanner failure did not break the job ✅"
+
+      # The same failure with fail_on_error true must stop the job.
+      - name: "Scanner failure blocks when fail_on_error is true"
+        id: hard-fail
+        uses: $/
         continue-on-error: true
         with:
-          invalid_input: "Some garbage"
+          path_prefix: "tests/fixtures/go"
+          languages: "go"
+          fail_on_error: "true"
+          # yamllint disable-line rule:line-length
+          image: "ghcr.io/cbomkit/cbomkit-action@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      - name: "Validate blocking failure"
+        shell: bash
+        env:
+          STEP_OUTCOME: ${{ steps.hard-fail.outcome }}
+        run: |
+          # Validate blocking failure
+          # Asserted unconditionally rather than behind an
+          # 'if: outcome == success' guard: a guarded check is skipped
+          # both when the step correctly failed AND when the
+          # expression fails to resolve, so it can pass without ever
+          # testing anything
+          if [ "${STEP_OUTCOME}" != "failure" ]; then
+            echo "Error: expected outcome 'failure', got" \
+              "'${STEP_OUTCOME}' ❌"
+            exit 1
+          fi
+          echo "fail_on_error true blocked the job ✅"
+
+      # Unsupported language values reach a Java valueOf() upstream and
+      # crash the container with an uncaught IllegalArgumentException,
+      # so the action must reject them before that point.
+      - name: "Reject unsupported language"
+        id: bad-language
+        uses: $/
+        continue-on-error: true
+        with:
+          path_prefix: "tests/fixtures/go"
+          languages: "golang"
+
+      - name: "Validate language rejection"
+        shell: bash
+        env:
+          STEP_OUTCOME: ${{ steps.bad-language.outcome }}
+        run: |
+          # Validate language rejection
+          if [ "${STEP_OUTCOME}" != "failure" ]; then
+            echo "Error: invalid language was accepted (outcome" \
+              "'${STEP_OUTCOME}') ❌"
+            exit 1
+          fi
+          echo "Unsupported language rejected ✅"
+
+      # path_prefix must not escape the workspace.
+      - name: "Reject path_prefix outside the workspace"
+        id: escape
+        uses: $/
+        continue-on-error: true
+        with:
+          path_prefix: "../../../etc"
+
+      - name: "Validate workspace escape rejection"
+        shell: bash
+        env:
+          STEP_OUTCOME: ${{ steps.escape.outcome }}
+        run: |
+          # Validate workspace escape rejection
+          if [ "${STEP_OUTCOME}" != "failure" ]; then
+            echo "Error: workspace escape was accepted (outcome" \
+              "'${STEP_OUTCOME}') ❌"
+            exit 1
+          fi
+          echo "Workspace escape rejected ✅"
+
+      # output_directory is both written to and bind-mounted into the
+      # container, so an escape here would expose arbitrary runner
+      # paths. Checked at point of use as well as during validation.
+      - name: "Reject output_directory outside the workspace"
+        id: escape-output
+        uses: $/
+        continue-on-error: true
+        with:
+          path_prefix: "tests/fixtures/go"
+          languages: "go"
+          output_directory: "../../../../tmp/cbom-escape"
+
+      - name: "Validate output escape rejection"
+        shell: bash
+        env:
+          STEP_OUTCOME: ${{ steps.escape-output.outcome }}
+        run: |
+          # Validate output escape rejection
+          if [ "${STEP_OUTCOME}" != "failure" ]; then
+            echo "Error: output escape was accepted (outcome" \
+              "'${STEP_OUTCOME}') ❌"
+            exit 1
+          fi
+          if [ -e "/tmp/cbom-escape" ]; then
+            echo "Error: action created a directory outside the" \
+              "workspace ❌"
+            exit 1
+          fi
+          echo "Output directory escape rejected ✅"
+
+      # 'docker run --volume' splits on ':', so a colon anywhere in a
+      # mount path silently changes what gets mounted. The directory
+      # is created at runtime rather than committed: a colon in a
+      # tracked path cannot be checked out on Windows.
+      - name: "Create a path containing a colon"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Create a path containing a colon
+          mkdir -p 'colon:dir'
+          cp tests/fixtures/go/go.mod tests/fixtures/go/main.go 'colon:dir/'
+
+      - name: "Reject a mount path containing a colon"
+        id: colon-path
+        uses: $/
+        continue-on-error: true
+        with:
+          path_prefix: "colon:dir"
+          languages: "go"
+
+      - name: "Validate colon rejection"
+        shell: bash
+        env:
+          STEP_OUTCOME: ${{ steps.colon-path.outcome }}
+        run: |
+          # Validate colon rejection
+          if [ "${STEP_OUTCOME}" != "failure" ]; then
+            echo "Error: colon in mount path was accepted (outcome" \
+              "'${STEP_OUTCOME}') ❌"
+            exit 1
+          fi
+          echo "Colon in mount path rejected ✅"
