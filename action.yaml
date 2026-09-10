@@ -111,16 +111,17 @@ runs:
         INPUT_IMAGE: ${{ inputs.image }}
       run: |
         # Validate inputs
-        # Preflight: fail with a clear message when required tools are
-        # missing (possible on minimal self-hosted runners)
-        for tool in docker jq realpath; do
-          if ! command -v "${tool}" > /dev/null 2>&1; then
-            echo "Error: required tool not found: ${tool} ❌"
-            echo "This action requires docker, jq and realpath"
-            echo "(GNU coreutils) on the runner"
-            exit 1
-          fi
-        done
+        # Preflight: fail with a clear message when required tools
+        # are missing (possible on minimal self-hosted runners).
+        # docker and jq are checked later, only on the path that
+        # actually needs them, so a repository with no supported
+        # language still reports 'skipped' on a minimal runner.
+        # realpath is needed here, for the path validation below.
+        if ! command -v realpath > /dev/null 2>&1; then
+          echo "Error: required tool not found: realpath ❌"
+          echo "This action requires realpath (GNU coreutils)"
+          exit 1
+        fi
         # The action requires GNU realpath -m (missing-path
         # resolution); BSD/macOS realpath lacks it, and failing here
         # gives a clearer error than a mid-run failure
@@ -149,15 +150,40 @@ runs:
               exit 1 ;;
           esac
         done
-        # Require a digest-pinned image by default but allow a tag for
-        # local experimentation; warn loudly so a tagged reference
-        # never silently becomes the norm in a pipeline
+        # A leading dash is rejected before anything else: the image
+        # is the final argument to 'docker run', so a value such as
+        # '--privileged' would be parsed as another CLI flag rather
+        # than an image name. Docker has no '--' end-of-options
+        # separator before the image, so validation is the only guard.
         case "${INPUT_IMAGE}" in
+          -*)
+            echo "Error: image reference cannot begin with '-' ❌"
+            echo "A leading dash parses as a docker run flag"
+            exit 1 ;;
           *[!A-Za-z0-9./:@_-]*|'')
             echo "Error: invalid image reference ❌"
             echo "Allowed characters: A-Z a-z 0-9 . / : @ _ -"
             exit 1 ;;
-          *@sha256:*) ;;
+        esac
+        # Require a digest-pinned image by default but allow a tag for
+        # local experimentation; warn loudly so a tagged reference
+        # never silently becomes the norm in a pipeline
+        case "${INPUT_IMAGE}" in
+          *@sha256:*)
+            # Validate the digest rather than trusting the '@sha256:'
+            # prefix, so a truncated or malformed value fails here
+            # with a clear message instead of at 'docker run'
+            image_digest="${INPUT_IMAGE##*@sha256:}"
+            case "${image_digest}" in
+              *[!0-9a-f]*|'')
+                echo "Error: image digest is not hexadecimal ❌"
+                exit 1 ;;
+            esac
+            if [ "${#image_digest}" -ne 64 ]; then
+              echo "Error: image digest must be 64 characters ❌"
+              echo "Got ${#image_digest} character(s)"
+              exit 1
+            fi ;;
           *)
             echo "::warning::CBOM scanner image is not digest-pinned;" \
               "results are not reproducible" ;;
@@ -279,6 +305,15 @@ runs:
           echo "No supported language detected; nothing to scan ⏭️"
           echo "skip=true" >> "$GITHUB_OUTPUT"
         else
+          # Only the scanning path needs these, so checking here keeps
+          # the skip path usable on a runner without them
+          for tool in docker jq; do
+            if ! command -v "${tool}" > /dev/null 2>&1; then
+              echo "Error: required tool not found: ${tool} ❌"
+              echo "Scanning ${languages} requires docker and jq"
+              exit 1
+            fi
+          done
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "Languages selected: ${languages}"
         fi
@@ -388,10 +423,39 @@ runs:
         OUTPUT_DIR="$(realpath -- "${OUTPUT_DIR}")"
         check_output_boundary "${OUTPUT_DIR}"
 
+        # 'docker run --volume' splits its argument on ':', and both
+        # paths trace back to caller-controlled inputs. A colon is
+        # legal in a POSIX path, so '/ws/my:dir' would split into a
+        # different host path, container path and option list, mounting
+        # somewhere unintended or failing obscurely. A newline would
+        # corrupt the argument just as badly. Neither can be escaped in
+        # a mount specification, so reject both with a clear message.
+        newline="$(printf '\nx')"
+        newline="${newline%x}"
+        for mount_var in PROJECT_DIR OUTPUT_DIR; do
+          mount_path="${!mount_var}"
+          case "${mount_path}" in
+            *:*)
+              echo "Error: ${mount_var} contains a colon ❌"
+              echo "A docker mount specification cannot express one"
+              exit 1 ;;
+            *"${newline}"*)
+              echo "Error: ${mount_var} contains a newline ❌"
+              exit 1 ;;
+          esac
+        done
+
         # The scanner reads GITHUB_WORKSPACE as its scan root and has
         # no project-directory option, so mount the project directory
-        # AS the workspace. Output goes to a separate mount so a
-        # nested output_directory cannot be picked up as scan input.
+        # AS the workspace. Output goes to its own mount so the
+        # scanner writes through a path it never indexes.
+        #
+        # Note this does not isolate the files themselves: an
+        # output_directory nested under path_prefix still surfaces
+        # inside /scan through the project mount. That is harmless in
+        # practice, because the indexers match source extensions and
+        # never .json, but it does mean the mounts alone are not a
+        # containment boundary.
         #
         # The mount is read-write on purpose: the Go scanner extracts
         # a helper binary into the scan tree at runtime.

@@ -346,3 +346,35 @@ jobs:
             exit 1
           fi
           echo "Output directory escape rejected ✅"
+
+      # 'docker run --volume' splits on ':', so a colon anywhere in a
+      # mount path silently changes what gets mounted. The directory
+      # is created at runtime rather than committed: a colon in a
+      # tracked path cannot be checked out on Windows.
+      - name: "Create a path containing a colon"
+        shell: bash
+        run: |
+          # Create a path containing a colon
+          mkdir -p 'colon:dir'
+          cp tests/fixtures/go/go.mod tests/fixtures/go/main.go 'colon:dir/'
+
+      - name: "Reject a mount path containing a colon"
+        id: colon-path
+        uses: $/
+        continue-on-error: true
+        with:
+          path_prefix: "colon:dir"
+          languages: "go"
+
+      - name: "Validate colon rejection"
+        shell: bash
+        env:
+          STEP_OUTCOME: ${{ steps.colon-path.outcome }}
+        run: |
+          # Validate colon rejection
+          if [ "${STEP_OUTCOME}" != "failure" ]; then
+            echo "Error: colon in mount path was accepted (outcome" \
+              "'${STEP_OUTCOME}') ❌"
+            exit 1
+          fi
+          echo "Colon in mount path rejected ✅"
